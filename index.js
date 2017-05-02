@@ -1,159 +1,187 @@
 'use strict';
-const path = require('path');
-const gutil = require('gulp-util');
-const through = require('through2');
-const vinylFile = require('vinyl-file');
-const revHash = require('rev-hash');
-const revPath = require('rev-path');
-const sortKeys = require('sort-keys');
-const modifyFilename = require('modify-filename');
+var path = require('path');
+var gutil = require('gulp-util');
+var through = require('through2');
+var objectAssign = require('object-assign');
+var file = require('vinyl-file');
+var revHash = require('rev-hash');
+var revPath = require('rev-path');
+var sortKeys = require('sort-keys');
+var modifyFilename = require('modify-filename');
 
 function relPath(base, filePath) {
-	if (filePath.indexOf(base) !== 0) {
-		return filePath.replace(/\\/g, '/');
-	}
+    if (filePath.indexOf(base) !== 0) {
+        return filePath.replace(/\\/g, '/');
+    }
 
-	const newPath = filePath.slice(base.length).replace(/\\/g, '/');
+    var newPath = filePath.substr(base.length).replace(/\\/g, '/');
 
-	if (newPath[0] === '/') {
-		return newPath.slice(1);
-	}
+    if (newPath[0] === '/') {
+        return newPath.substr(1);
+    }
 
-	return newPath;
+    return newPath;
 }
 
-function transformFilename(file) {
-	// save the old path for later
-	file.revOrigPath = file.path;
-	file.revOrigBase = file.base;
-	file.revHash = revHash(file.contents);
+function getManifestFile(opts, cb) {
+    file.read(opts.path, opts, function (err, manifest) {
+        if (err) {
+            // not found
+            if (err.code === 'ENOENT') {
+                cb(null, new gutil.File(opts));
+            } else {
+                cb(err);
+            }
 
-	file.path = modifyFilename(file.path, (filename, extension) => {
-		const extIndex = filename.indexOf('.');
+            return;
+        }
 
-		filename = extIndex === -1 ?
-			revPath(filename, file.revHash) :
-			revPath(filename.slice(0, extIndex), file.revHash) + filename.slice(extIndex);
-
-		return filename + extension;
-	});
+        cb(null, manifest);
+    });
 }
 
-const getManifestFile = opts => vinylFile.read(opts.path, opts).catch(err => {
-	if (err.code === 'ENOENT') {
-		return new gutil.File(opts);
-	}
+function transformFilename(file, opts) {
+    // save the old path for later
+    file.revOrigPath = file.path;
+    file.revOrigBase = file.base;
+    file.revHash = revHash(file.contents);
 
-	throw err;
-});
+    file.path = modifyFilename(file.path, function (filename, extension) {
+        var extIndex = filename.indexOf('.');
 
-const plugin = () => {
-	const sourcemaps = [];
-	const pathMap = {};
+        if (opts.hashInQuery) {
+            filename = extIndex === -1 ?
+                revPath.revert(revPath(filename, file.revHash), file.revHash) :
+                revPath.revert(revPath(filename.slice(0, extIndex), file.revHash), file.revHash) + filename.slice(extIndex);
+        } else {
+            filename = extIndex === -1 ?
+                revPath(filename, file.revHash) :
+                revPath(filename.slice(0, extIndex), file.revHash) + filename.slice(extIndex);
+        }
+        return filename + extension;
+    });
+}
 
-	return through.obj((file, enc, cb) => {
-		if (file.isNull()) {
-			cb(null, file);
-			return;
-		}
+var plugin = function (opts) {
+    var sourcemaps = [];
+    var pathMap = {};
 
-		if (file.isStream()) {
-			cb(new gutil.PluginError('gulp-rev', 'Streaming not supported'));
-			return;
-		}
+    opts = objectAssign({
+        hashInQuery: false
+    }, opts);
 
-		// this is a sourcemap, hold until the end
-		if (path.extname(file.path) === '.map') {
-			sourcemaps.push(file);
-			cb();
-			return;
-		}
+    return through.obj(function (file, enc, cb) {
+        if (file.isNull()) {
+            cb(null, file);
+            return;
+        }
 
-		const oldPath = file.path;
-		transformFilename(file);
-		pathMap[oldPath] = file.revHash;
+        if (file.isStream()) {
+            cb(new gutil.PluginError('gulp-rev', 'Streaming not supported'));
+            return;
+        }
 
-		cb(null, file);
-	}, function (cb) {
-		sourcemaps.forEach(file => {
-			let reverseFilename;
+        // this is a sourcemap, hold until the end
+        if (path.extname(file.path) === '.map') {
+            sourcemaps.push(file);
+            cb();
+            return;
+        }
 
-			// attempt to parse the sourcemap's JSON to get the reverse filename
-			try {
-				reverseFilename = JSON.parse(file.contents.toString()).file;
-			} catch (err) {}
+        var oldPath = file.path;
+        transformFilename(file, opts);
+        pathMap[oldPath] = file.revHash;
 
-			if (!reverseFilename) {
-				reverseFilename = path.relative(path.dirname(file.path), path.basename(file.path, '.map'));
-			}
+        cb(null, file);
+    }, function (cb) {
+        sourcemaps.forEach(function (file) {
+            var reverseFilename;
 
-			if (pathMap[reverseFilename]) {
-				// save the old path for later
-				file.revOrigPath = file.path;
-				file.revOrigBase = file.base;
+            // attempt to parse the sourcemap's JSON to get the reverse filename
+            try {
+                reverseFilename = JSON.parse(file.contents.toString()).file;
+            } catch (err) { }
 
-				const hash = pathMap[reverseFilename];
-				file.path = revPath(file.path.replace(/\.map$/, ''), hash) + '.map';
-			} else {
-				transformFilename(file);
-			}
+            if (!reverseFilename) {
+                reverseFilename = path.relative(path.dirname(file.path), path.basename(file.path, '.map'));
+            }
 
-			this.push(file);
-		});
+            if (pathMap[reverseFilename]) {
+                // save the old path for later
+                file.revOrigPath = file.path;
+                file.revOrigBase = file.base;
 
-		cb();
-	});
+                var hash = pathMap[reverseFilename];
+                file.path = revPath.revert(revPath(file.path.replace(/\.map$/, ''), hash), hash) + '.map';
+            } else {
+                transformFilename(file, opts);
+            }
+
+            this.push(file);
+        }, this);
+
+        cb();
+    });
 };
 
-plugin.manifest = (pth, opts) => {
-	if (typeof pth === 'string') {
-		pth = {path: pth};
-	}
+plugin.manifest = function (pth, opts) {
+    if (typeof pth === 'string') {
+        pth = { path: pth };
+    }
 
-	opts = Object.assign({
-		path: 'rev-manifest.json',
-		merge: false,
-		transformer: JSON
-	}, opts, pth);
+    opts = objectAssign({
+        path: 'rev-manifest.json',
+        merge: false,
+        // Apply the default JSON transformer.
+        // The user can pass in his on transformer if he wants. The only requirement is that it should
+        // support 'parse' and 'stringify' methods.
+        transformer: JSON,
+        hashInQuery: false
+    }, opts, pth);
 
-	let manifest = {};
+    var manifest = {};
 
-	return through.obj((file, enc, cb) => {
-		// ignore all non-rev'd files
-		if (!file.path || !file.revOrigPath) {
-			cb();
-			return;
-		}
+    return through.obj(function (file, enc, cb) {
+        // ignore all non-rev'd files
+        if (!file.path || !file.revOrigPath) {
+            cb();
+            return;
+        }
 
-		const revisionedFile = relPath(file.base, file.path);
-		const originalFile = path.join(path.dirname(revisionedFile), path.basename(file.revOrigPath)).replace(/\\/g, '/');
+        var revisionedFile = relPath(file.base, file.path);
+        var originalFile = path.join(path.dirname(revisionedFile), path.basename(file.revOrigPath)).replace(/\\/g, '/');
 
-		manifest[originalFile] = revisionedFile;
+        manifest[originalFile] = opts.hashInQuery ? originalFile + '?v=' + file.revHash : revisionedFile;
 
-		cb();
-	}, function (cb) {
-		// no need to write a manifest file if there's nothing to manifest
-		if (Object.keys(manifest).length === 0) {
-			cb();
-			return;
-		}
+        cb();
+    }, function (cb) {
+        // no need to write a manifest file if there's nothing to manifest
+        if (Object.keys(manifest).length === 0) {
+            cb();
+            return;
+        }
 
-		getManifestFile(opts).then(manifestFile => {
-			if (opts.merge && !manifestFile.isNull()) {
-				let oldManifest = {};
+        getManifestFile(opts, function (err, manifestFile) {
+            if (err) {
+                cb(err);
+                return;
+            }
 
-				try {
-					oldManifest = opts.transformer.parse(manifestFile.contents.toString());
-				} catch (err) {}
+            if (opts.merge && !manifestFile.isNull()) {
+                var oldManifest = {};
 
-				manifest = Object.assign(oldManifest, manifest);
-			}
+                try {
+                    oldManifest = opts.transformer.parse(manifestFile.contents.toString());
+                } catch (err) { }
 
-			manifestFile.contents = new Buffer(opts.transformer.stringify(sortKeys(manifest), null, '  '));
-			this.push(manifestFile);
-			cb();
-		}).catch(cb);
-	});
+                manifest = objectAssign(oldManifest, manifest);
+            }
+
+            manifestFile.contents = new Buffer(opts.transformer.stringify(sortKeys(manifest), null, '  '));
+            this.push(manifestFile);
+            cb();
+        }.bind(this));
+    });
 };
 
 module.exports = plugin;
